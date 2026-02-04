@@ -52,10 +52,10 @@ Or search for "Copilot Browser Bridge" in VS Code Extensions (`Ctrl+Shift+X`)
 
 ## ⚙️ Settings
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `copilotBrowserBridge.serverPort` | 3210 | Local server port number |
-| `copilotBrowserBridge.autoStart` | true | Auto-start server on VS Code launch |
+| Setting                           | Default | Description                         |
+| --------------------------------- | ------- | ----------------------------------- |
+| `copilotBrowserBridge.serverPort` | 3210    | Local server port number            |
+| `copilotBrowserBridge.autoStart`  | true    | Auto-start server on VS Code launch |
 
 ## 🔧 Development
 
