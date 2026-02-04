@@ -1,6 +1,12 @@
 # Copilot Browser Bridge for VS Code
 
-🔗 Chrome拡張機能と連携して、ブラウザのページ内容をGitHub Copilot / ローカルLLMで解析・対話するVS Code拡張機能
+[![VS Code Marketplace](https://img.shields.io/visual-studio-marketplace/v/yamapan.copilot-browser-bridge-vscode?label=VS%20Code%20Marketplace&logo=visual-studio-code)](https://marketplace.visualstudio.com/items?itemName=yamapan.copilot-browser-bridge-vscode)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![GitHub](https://img.shields.io/github/stars/aktsmm/copilot-browser-bridge-vscode?style=social)](https://github.com/aktsmm/copilot-browser-bridge-vscode)
+
+🔗 Chrome拡張機能と連携して、ブラウザのページ内容をLLM（GitHub Copilot / ローカルLLM）で解析・対話するVS Code拡張機能
+
+[Install from VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=yamapan.copilot-browser-bridge-vscode)
 
 ## ✨ 特徴
 
@@ -9,31 +15,21 @@
 - **自動起動**: VS Code起動時に自動でサーバーを開始
 - **Vision対応**: スクリーンショットをLLMに送信して視覚的理解
 
-## 🚀 インストール
+## 📥 インストール
 
-### VS Code Marketplace（準備中）
-
-Coming soon...
-
-### 開発版（ローカルインストール）
+### VS Code Marketplace
 
 ```bash
-# リポジトリをクローン
-git clone https://github.com/aktsmm/copilot-browser-bridge-vscode.git
-cd copilot-browser-bridge-vscode
-
-# 依存関係をインストール
-npm install
-
-# ビルド
-npm run compile
-
-# VSIXパッケージを作成
-npx @vscode/vsce package
-
-# インストール
-code --install-extension copilot-browser-bridge-vscode-0.1.0.vsix
+ext install yamapan.copilot-browser-bridge-vscode
 ```
+
+または VS Code の拡張機能パネル (`Ctrl+Shift+X`) で「Copilot Browser Bridge」を検索
+
+### 手動インストール
+
+1. [Releases](https://github.com/aktsmm/copilot-browser-bridge-vscode/releases) から `.vsix` をダウンロード
+2. VS Code: `Ctrl+Shift+P` → `Extensions: Install from VSIX...`
+3. ダウンロードした `.vsix` を選択
 
 ## 📋 必要条件
 
@@ -54,10 +50,10 @@ code --install-extension copilot-browser-bridge-vscode-0.1.0.vsix
 
 ## ⚙️ 設定
 
-| 設定 | デフォルト | 説明 |
-|------|-----------|------|
-| `copilotBrowserBridge.serverPort` | 3210 | ローカルサーバーのポート番号 |
-| `copilotBrowserBridge.autoStart` | true | VS Code起動時に自動でサーバーを開始 |
+| 設定                              | デフォルト | 説明                                |
+| --------------------------------- | ---------- | ----------------------------------- |
+| `copilotBrowserBridge.serverPort` | 3210       | ローカルサーバーのポート番号        |
+| `copilotBrowserBridge.autoStart`  | true       | VS Code起動時に自動でサーバーを開始 |
 
 ## 🔧 開発
 
@@ -74,8 +70,18 @@ npx @vscode/vsce package
 
 ## 📄 ライセンス
 
-MIT License
+MIT License © [yamapan](https://github.com/aktsmm)
+
+## 🔒 プライバシー
+
+- **データ収集**: 行いません
+- **通信**: ローカルホスト（localhost:3210）でのみ動作
+- **外部送信**: LLMプロバイダー選択に応じてCopilot/ローカルLLMにのみ送信
 
 ## 🔗 関連プロジェクト
 
 - [Copilot Browser Bridge (Chrome Extension)](https://github.com/aktsmm/copilot-browser-bridge)
+
+## 👤 Author
+
+yamapan (https://github.com/aktsmm)
