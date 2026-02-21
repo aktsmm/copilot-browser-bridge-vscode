@@ -793,19 +793,12 @@ ${pageContent ? `## 📄 現在のWebページ:\n${pageContent.slice(0, 12000)}`
         case "create_file": {
           const path = params.path as string;
           const content = params.content as string;
-          const workspaceFolders = vscode.workspace.workspaceFolders;
-          if (!workspaceFolders) {
-            return {
-              success: false,
-              result: "ワークスペースが開かれていません",
-            };
-          }
-          const uri = vscode.Uri.joinPath(workspaceFolders[0].uri, path);
-          await vscode.workspace.fs.writeFile(
-            uri,
-            new TextEncoder().encode(content),
-          );
-          return { success: true, result: `ファイルを作成しました: ${path}` };
+          // Encode content as base64 to avoid delimiter issues
+          const b64 = Buffer.from(content, "utf-8").toString("base64");
+          return {
+            success: true,
+            result: `__DOWNLOAD_FILE__:${path}:${b64}:__END_DOWNLOAD__`,
+          };
         }
 
         case "run_terminal": {
