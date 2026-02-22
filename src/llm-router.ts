@@ -170,7 +170,7 @@ ${browserActionsDoc}
     return `あなたはユーザーの頼れるアシスタントです。Webページを分析し、ブラウザを操作し、ファイルを作成できます。
 
 ---ページ内容---
-${pageContent.slice(0, 8000)}
+${pageContent.slice(0, 20000)}
 ---ページ内容ここまで---
 
 ## できること
