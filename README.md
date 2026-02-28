@@ -73,6 +73,10 @@ npx @vscode/vsce package
 
 CC BY-NC-SA 4.0 © [aktsmm](https://github.com/aktsmm)
 
+## 📑 Third-Party Notices
+
+- [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)
+
 ## 🔒 Privacy
 
 - **Data Collection**: None

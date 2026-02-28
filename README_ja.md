@@ -1,7 +1,7 @@
 # Copilot Browser Bridge for VS Code
 
 [![VS Code Marketplace](https://img.shields.io/visual-studio-marketplace/v/yamapan.copilot-browser-bridge-vscode?label=VS%20Code%20Marketplace&logo=visual-studio-code)](https://marketplace.visualstudio.com/items?itemName=yamapan.copilot-browser-bridge-vscode)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](LICENSE)
 [![GitHub](https://img.shields.io/github/stars/aktsmm/copilot-browser-bridge-vscode?style=social)](https://github.com/aktsmm/copilot-browser-bridge-vscode)
 
 🔗 Chrome拡張機能と連携して、ブラウザのページ内容をLLM（GitHub Copilot / ローカルLLM）で解析・対話するVS Code拡張機能
@@ -74,7 +74,11 @@ npx @vscode/vsce package
 
 ## 📄 ライセンス
 
-MIT License © [yamapan](https://github.com/aktsmm)
+CC BY-NC-SA 4.0 © [aktsmm](https://github.com/aktsmm)
+
+## 📑 サードパーティ通知
+
+- [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)
 
 ## 🔒 プライバシー
 
