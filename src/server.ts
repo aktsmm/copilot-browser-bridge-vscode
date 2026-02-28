@@ -1,6 +1,15 @@
 import * as http from "http";
+import * as path from "path";
 import * as vscode from "vscode";
 import { LLMRouter, ChatRequest } from "./llm-router";
+
+type ValidationResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: string };
+
+const DEFAULT_ALLOWED_EXTENSION_ORIGINS = [
+  "chrome-extension://nggfpdadfepkbpjfnpcihagbnnfpeian",
+] as const;
 
 export class BridgeServer {
   private server: http.Server | null = null;
@@ -12,12 +21,25 @@ export class BridgeServer {
     this.llmRouter = new LLMRouter();
   }
 
-  start(): void {
+  start(): Promise<void> {
     this.server = http.createServer(async (req, res) => {
-      // CORS headers
-      res.setHeader("Access-Control-Allow-Origin", "*");
+      const requestOrigin = this.getRequestOrigin(req);
+      if (requestOrigin && !this.isAllowedOrigin(requestOrigin)) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Forbidden origin" }));
+        return;
+      }
+
+      if (requestOrigin) {
+        res.setHeader("Access-Control-Allow-Origin", requestOrigin);
+        res.setHeader("Vary", "Origin");
+      }
+
       res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+      res.setHeader(
+        "Access-Control-Allow-Headers",
+        "Content-Type, X-Copilot-Bridge-Client",
+      );
 
       if (req.method === "OPTIONS") {
         res.writeHead(204);
@@ -25,10 +47,31 @@ export class BridgeServer {
         return;
       }
 
-      const url = new URL(req.url || "/", `http://localhost:${this.port}`);
+      let url: URL;
+      try {
+        url = new URL(req.url || "/", `http://localhost:${this.port}`);
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid request URL" }));
+        return;
+      }
+
+      const isHealthCheck = url.pathname === "/health" && req.method === "GET";
+
+      if (!isHealthCheck && !requestOrigin) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Origin header is required" }));
+        return;
+      }
+
+      if (!isHealthCheck && !this.hasTrustedClientHeader(req)) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized client" }));
+        return;
+      }
 
       try {
-        if (url.pathname === "/health" && req.method === "GET") {
+        if (isHealthCheck) {
           await this.handleHealth(res);
         } else if (url.pathname === "/chat" && req.method === "POST") {
           await this.handleChat(req, res);
@@ -44,20 +87,46 @@ export class BridgeServer {
         ) {
           await this.handlePlaywrightStatus(res);
         } else {
-          res.writeHead(404);
+          res.writeHead(404, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Not found" }));
         }
       } catch (error) {
         console.error("Server error:", error);
-        res.writeHead(500);
+        res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Internal server error" }));
       }
     });
 
-    this.server.listen(this.port, "127.0.0.1", () => {
-      console.log(
-        `Copilot Browser Bridge: Server listening on http://127.0.0.1:${this.port}`,
-      );
+    return new Promise((resolve, reject) => {
+      const activeServer = this.server;
+      if (!activeServer) {
+        reject(new Error("Server initialization failed"));
+        return;
+      }
+
+      const onListening = () => {
+        activeServer.off("error", onStartupError);
+        console.log(
+          `Copilot Browser Bridge: Server listening on http://127.0.0.1:${this.port}`,
+        );
+        resolve();
+      };
+
+      const onStartupError = (error: NodeJS.ErrnoException) => {
+        activeServer.off("listening", onListening);
+        this.server = null;
+
+        if (error.code === "EADDRINUSE") {
+          reject(new Error(`Port ${this.port} is already in use`));
+          return;
+        }
+
+        reject(error);
+      };
+
+      activeServer.once("listening", onListening);
+      activeServer.once("error", onStartupError);
+      activeServer.listen(this.port, "127.0.0.1");
     });
   }
 
@@ -67,6 +136,37 @@ export class BridgeServer {
       this.server = null;
       console.log("Copilot Browser Bridge: Server stopped");
     }
+  }
+
+  private getRequestOrigin(req: http.IncomingMessage): string | undefined {
+    const origin = req.headers.origin;
+    return typeof origin === "string" ? origin : undefined;
+  }
+
+  private isAllowedOrigin(origin: string): boolean {
+    const configuredOrigins = vscode.workspace
+      .getConfiguration("copilotBrowserBridge")
+      .get<string[]>("allowedExtensionOrigins", []);
+
+    const normalizedConfiguredOrigins = configuredOrigins
+      .filter((value) => typeof value === "string")
+      .map((value) => value.trim())
+      .filter((value) => /^chrome-extension:\/\/[a-p]{32}$/.test(value));
+
+    const allowedOrigins = new Set<string>([
+      ...DEFAULT_ALLOWED_EXTENSION_ORIGINS,
+      ...normalizedConfiguredOrigins,
+    ]);
+
+    return allowedOrigins.has(origin);
+  }
+
+  private hasTrustedClientHeader(req: http.IncomingMessage): boolean {
+    const headerValue = req.headers["x-copilot-bridge-client"];
+    const clientValue = Array.isArray(headerValue)
+      ? headerValue[0]
+      : headerValue;
+    return clientValue === "chrome-extension";
   }
 
   private async handleHealth(res: http.ServerResponse): Promise<void> {
@@ -84,8 +184,19 @@ export class BridgeServer {
     req: http.IncomingMessage,
     res: http.ServerResponse,
   ): Promise<void> {
-    const body = await this.readBody(req);
-    const request: ChatRequest = JSON.parse(body);
+    const requestBody = await this.readJsonBody<unknown>(req, res);
+    if (requestBody === null) {
+      return;
+    }
+
+    const validation = this.validateChatRequest(requestBody);
+    if (!validation.ok) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: validation.error }));
+      return;
+    }
+
+    const request = validation.value;
 
     // Debug: Log screenshot info
     console.log(`[Server] handleChat called`);
@@ -93,9 +204,6 @@ export class BridgeServer {
     console.log(`[Server] Screenshot present: ${!!request.screenshot}`);
     if (request.screenshot) {
       console.log(`[Server] Screenshot length: ${request.screenshot.length}`);
-      console.log(
-        `[Server] Screenshot first 50 chars: ${request.screenshot.substring(0, 50)}`,
-      );
     }
 
     // Set streaming headers
@@ -124,25 +232,320 @@ export class BridgeServer {
 
   private readBody(req: http.IncomingMessage): Promise<string> {
     return new Promise((resolve, reject) => {
-      let body = "";
-      req.on("data", (chunk) => {
-        body += chunk.toString();
+      const chunks: Buffer[] = [];
+      let receivedBytes = 0;
+      const maxBodyBytes = 5 * 1024 * 1024;
+
+      req.on("data", (chunk: Buffer | string) => {
+        const chunkBuffer =
+          typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+
+        receivedBytes += chunkBuffer.byteLength;
+        if (receivedBytes > maxBodyBytes) {
+          reject(new Error("REQUEST_TOO_LARGE"));
+          req.destroy();
+          return;
+        }
+
+        chunks.push(chunkBuffer);
       });
-      req.on("end", () => resolve(body));
+      req.on("end", () => {
+        resolve(Buffer.concat(chunks).toString("utf-8"));
+      });
       req.on("error", reject);
     });
+  }
+
+  private async readJsonBody<T>(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): Promise<T | null> {
+    let body = "";
+    try {
+      body = await this.readBody(req);
+    } catch (error) {
+      if (error instanceof Error && error.message === "REQUEST_TOO_LARGE") {
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Request body too large" }));
+        return null;
+      }
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Failed to read request body" }));
+      return null;
+    }
+
+    if (!body.trim()) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request body is required" }));
+      return null;
+    }
+
+    try {
+      return JSON.parse(body) as T;
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Invalid JSON body" }));
+      return null;
+    }
+  }
+
+  private validateChatRequest(request: unknown): ValidationResult<ChatRequest> {
+    if (!request || typeof request !== "object") {
+      return { ok: false, error: "Invalid chat request body" };
+    }
+
+    const body = request as Record<string, unknown>;
+    const settings = body.settings as Record<string, unknown> | undefined;
+
+    if (!settings || typeof settings !== "object") {
+      return { ok: false, error: "Invalid chat settings" };
+    }
+
+    const provider = settings.provider;
+    const allowedProviders = ["copilot", "copilot-agent", "lm-studio"];
+    if (typeof provider !== "string" || !allowedProviders.includes(provider)) {
+      return { ok: false, error: "Invalid provider" };
+    }
+
+    if (provider === "copilot" || provider === "copilot-agent") {
+      const copilotSettings = settings.copilot as Record<string, unknown>;
+      if (
+        !copilotSettings ||
+        typeof copilotSettings !== "object" ||
+        typeof copilotSettings.model !== "string" ||
+        copilotSettings.model.trim().length === 0
+      ) {
+        return { ok: false, error: "Invalid copilot settings" };
+      }
+    }
+
+    if (provider === "lm-studio") {
+      const lmStudioSettings = settings.lmStudio as Record<string, unknown>;
+      if (
+        !lmStudioSettings ||
+        typeof lmStudioSettings !== "object" ||
+        typeof lmStudioSettings.endpoint !== "string" ||
+        typeof lmStudioSettings.model !== "string"
+      ) {
+        return { ok: false, error: "Invalid lmStudio settings" };
+      }
+
+      if (lmStudioSettings.endpoint.trim().length === 0) {
+        return { ok: false, error: "Invalid lmStudio endpoint" };
+      }
+    }
+
+    if (typeof body.pageContent !== "string") {
+      return { ok: false, error: "Invalid pageContent" };
+    }
+
+    if (!Array.isArray(body.messages)) {
+      return { ok: false, error: "Invalid messages" };
+    }
+
+    const roleSet = new Set(["user", "assistant", "system"]);
+    for (const message of body.messages) {
+      if (!message || typeof message !== "object") {
+        return { ok: false, error: "Invalid message item" };
+      }
+
+      const role = (message as Record<string, unknown>).role;
+      const content = (message as Record<string, unknown>).content;
+      if (typeof role !== "string" || !roleSet.has(role)) {
+        return { ok: false, error: "Invalid message role" };
+      }
+      if (typeof content !== "string") {
+        return { ok: false, error: "Invalid message content" };
+      }
+    }
+
+    if (body.screenshot !== undefined && typeof body.screenshot !== "string") {
+      return { ok: false, error: "Invalid screenshot" };
+    }
+
+    if (
+      body.operationMode !== undefined &&
+      body.operationMode !== "text" &&
+      body.operationMode !== "hybrid" &&
+      body.operationMode !== "screenshot"
+    ) {
+      return { ok: false, error: "Invalid operationMode" };
+    }
+
+    return { ok: true, value: request as ChatRequest };
+  }
+
+  private validateFileOperationRequest(request: unknown): ValidationResult<{
+    action: "create" | "read" | "append" | "delete";
+    path: string;
+    content?: string;
+  }> {
+    if (!request || typeof request !== "object") {
+      return { ok: false, error: "Invalid file operation body" };
+    }
+
+    const body = request as Record<string, unknown>;
+    const action = body.action;
+    if (
+      action !== "create" &&
+      action !== "read" &&
+      action !== "append" &&
+      action !== "delete"
+    ) {
+      return { ok: false, error: "Invalid action" };
+    }
+
+    if (typeof body.path !== "string") {
+      return { ok: false, error: "Invalid file path" };
+    }
+
+    if (body.content !== undefined && typeof body.content !== "string") {
+      return { ok: false, error: "Invalid file content" };
+    }
+
+    return {
+      ok: true,
+      value: {
+        action,
+        path: body.path,
+        content: body.content as string | undefined,
+      },
+    };
+  }
+
+  private validatePlaywrightRequest(request: unknown): ValidationResult<{
+    action: string;
+    params: Record<string, unknown>;
+  }> {
+    if (!request || typeof request !== "object") {
+      return { ok: false, error: "Invalid playwright request body" };
+    }
+
+    const body = request as Record<string, unknown>;
+    const action =
+      typeof body.action === "string" ? body.action.trim() : undefined;
+    if (!action) {
+      return { ok: false, error: "Invalid playwright action" };
+    }
+
+    const params = body.params;
+    if (
+      params !== undefined &&
+      (params === null || typeof params !== "object" || Array.isArray(params))
+    ) {
+      return { ok: false, error: "Invalid playwright params" };
+    }
+
+    return {
+      ok: true,
+      value: {
+        action,
+        params: (params ?? {}) as Record<string, unknown>,
+      },
+    };
+  }
+
+  private isSafeRelativePath(inputPath: unknown): boolean {
+    if (typeof inputPath !== "string" || !inputPath.trim()) {
+      return false;
+    }
+
+    const normalized = inputPath.replace(/\\/g, "/").trim();
+    if (
+      normalized.startsWith("/") ||
+      normalized.includes("://") ||
+      normalized.includes(":")
+    ) {
+      return false;
+    }
+
+    if (normalized.endsWith("/")) {
+      return false;
+    }
+
+    const segments = normalized.split("/");
+    if (segments.some((segment) => segment.length === 0)) {
+      return false;
+    }
+
+    return !segments.some((segment) => segment === ".." || segment === ".");
+  }
+
+  private isWithinWorkspace(
+    workspaceUri: vscode.Uri,
+    targetUri: vscode.Uri,
+  ): boolean {
+    const workspacePath = path.resolve(workspaceUri.fsPath).toLowerCase();
+    const targetPath = path.resolve(targetUri.fsPath).toLowerCase();
+    return (
+      targetPath === workspacePath ||
+      targetPath.startsWith(`${workspacePath}${path.sep.toLowerCase()}`)
+    );
+  }
+
+  private getParentDirectoryUri(
+    workspaceUri: vscode.Uri,
+    relativePath: string,
+  ): vscode.Uri {
+    const normalized = relativePath.replace(/\\/g, "/");
+    const segments = normalized.split("/").filter(Boolean);
+    const parentSegments = segments.slice(0, -1);
+
+    return parentSegments.length > 0
+      ? vscode.Uri.joinPath(workspaceUri, ...parentSegments)
+      : workspaceUri;
+  }
+
+  private async statSafe(
+    targetUri: vscode.Uri,
+  ): Promise<vscode.FileStat | null> {
+    try {
+      return await vscode.workspace.fs.stat(targetUri);
+    } catch {
+      return null;
+    }
+  }
+
+  private isRegularFile(fileType: vscode.FileType): boolean {
+    return (fileType & vscode.FileType.File) === vscode.FileType.File;
+  }
+
+  private async fetchWithTimeout(
+    url: string,
+    init: RequestInit,
+    timeoutMs: number,
+  ): Promise<Response> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      return await fetch(url, {
+        ...init,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   private async handleFileOperation(
     req: http.IncomingMessage,
     res: http.ServerResponse,
   ): Promise<void> {
-    const body = await this.readBody(req);
-    const { action, path, content } = JSON.parse(body) as {
-      action: "create" | "read" | "append" | "delete";
-      path: string;
-      content?: string;
-    };
+    const requestBody = await this.readJsonBody<unknown>(req, res);
+
+    if (requestBody === null) {
+      return;
+    }
+
+    const validation = this.validateFileOperationRequest(requestBody);
+    if (!validation.ok) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: validation.error }));
+      return;
+    }
+
+    const { action, path: filePath, content } = validation.value;
 
     try {
       const workspaceFolders = vscode.workspace.workspaceFolders;
@@ -153,10 +556,35 @@ export class BridgeServer {
       }
 
       const workspaceUri = workspaceFolders[0].uri;
-      const fileUri = vscode.Uri.joinPath(workspaceUri, path);
+      if (!this.isSafeRelativePath(filePath)) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid file path" }));
+        return;
+      }
+
+      const pathSegments = filePath.replace(/\\/g, "/").split("/");
+      const fileUri = vscode.Uri.joinPath(workspaceUri, ...pathSegments);
+
+      if (!this.isWithinWorkspace(workspaceUri, fileUri)) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Path escapes workspace" }));
+        return;
+      }
 
       switch (action) {
         case "create": {
+          const existing = await this.statSafe(fileUri);
+          if (existing && !this.isRegularFile(existing.type)) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Target path is not a file" }));
+            break;
+          }
+
+          const parentDirectoryUri = this.getParentDirectoryUri(
+            workspaceUri,
+            filePath,
+          );
+          await vscode.workspace.fs.createDirectory(parentDirectoryUri);
           const encoder = new TextEncoder();
           await vscode.workspace.fs.writeFile(
             fileUri,
@@ -164,11 +592,24 @@ export class BridgeServer {
           );
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
-            JSON.stringify({ success: true, message: `Created ${path}` }),
+            JSON.stringify({ success: true, message: `Created ${filePath}` }),
           );
           break;
         }
         case "read": {
+          const stat = await this.statSafe(fileUri);
+          if (!stat) {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "File not found" }));
+            break;
+          }
+
+          if (!this.isRegularFile(stat.type)) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Target path is not a file" }));
+            break;
+          }
+
           const data = await vscode.workspace.fs.readFile(fileUri);
           const decoder = new TextDecoder();
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -178,13 +619,23 @@ export class BridgeServer {
           break;
         }
         case "append": {
+          const existing = await this.statSafe(fileUri);
+          if (existing && !this.isRegularFile(existing.type)) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Target path is not a file" }));
+            break;
+          }
+
           let existingContent = "";
-          try {
+          if (existing) {
             const data = await vscode.workspace.fs.readFile(fileUri);
             existingContent = new TextDecoder().decode(data);
-          } catch {
-            // File doesn't exist, will create new
           }
+          const parentDirectoryUri = this.getParentDirectoryUri(
+            workspaceUri,
+            filePath,
+          );
+          await vscode.workspace.fs.createDirectory(parentDirectoryUri);
           const encoder = new TextEncoder();
           await vscode.workspace.fs.writeFile(
             fileUri,
@@ -192,15 +643,34 @@ export class BridgeServer {
           );
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
-            JSON.stringify({ success: true, message: `Appended to ${path}` }),
+            JSON.stringify({
+              success: true,
+              message: `Appended to ${filePath}`,
+            }),
           );
           break;
         }
         case "delete": {
-          await vscode.workspace.fs.delete(fileUri);
+          const stat = await this.statSafe(fileUri);
+          if (!stat) {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "File not found" }));
+            break;
+          }
+
+          if (!this.isRegularFile(stat.type)) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Target path is not a file" }));
+            break;
+          }
+
+          await vscode.workspace.fs.delete(fileUri, {
+            recursive: false,
+            useTrash: false,
+          });
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
-            JSON.stringify({ success: true, message: `Deleted ${path}` }),
+            JSON.stringify({ success: true, message: `Deleted ${filePath}` }),
           );
           break;
         }
@@ -226,30 +696,65 @@ export class BridgeServer {
   private async handlePlaywrightStatus(
     res: http.ServerResponse,
   ): Promise<void> {
-    // Check if Playwright MCP tools are available
-    // This is a simple check - in production you'd verify MCP connection
-    const available = true; // Assume available if server is running with MCP
+    const available = await this.isPlaywrightMcpAvailable();
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ available, version: "1.0.0" }));
+  }
+
+  private async isPlaywrightMcpAvailable(): Promise<boolean> {
+    try {
+      const response = await this.fetchWithTimeout(
+        "http://127.0.0.1:3001/call",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            tool: "browser_tabs",
+            arguments: { action: "list" },
+          }),
+        },
+        1500,
+      );
+      return response.ok;
+    } catch {
+      return false;
+    }
   }
 
   private async handlePlaywrightAction(
     req: http.IncomingMessage,
     res: http.ServerResponse,
   ): Promise<void> {
-    const body = await this.readBody(req);
-    const { action, params } = JSON.parse(body) as {
-      action: string;
-      params: Record<string, unknown>;
-    };
+    const requestBody = await this.readJsonBody<unknown>(req, res);
+
+    if (requestBody === null) {
+      return;
+    }
+
+    const validation = this.validatePlaywrightRequest(requestBody);
+    if (!validation.ok) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: false, error: validation.error }));
+      return;
+    }
+
+    const { action, params } = validation.value;
 
     try {
       // Execute Playwright action via VS Code command
       // This delegates to the MCP tools available in the environment
       const result = await this.executePlaywrightMcpAction(action, params);
 
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(result));
+      const statusCode = result.success ? 200 : (result.statusCode ?? 502);
+      res.writeHead(statusCode, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          success: result.success,
+          message: result.message,
+          error: result.error,
+          data: result.data,
+        }),
+      );
     } catch (error) {
       console.error("Playwright action error:", error);
       res.writeHead(500, { "Content-Type": "application/json" });
@@ -267,6 +772,7 @@ export class BridgeServer {
     params: Record<string, unknown>,
   ): Promise<{
     success: boolean;
+    statusCode?: number;
     message?: string;
     error?: string;
     data?: unknown;
@@ -292,26 +798,35 @@ export class BridgeServer {
 
     const mcpTool = mcpToolMap[action];
     if (!mcpTool) {
-      return { success: false, error: `Unknown Playwright action: ${action}` };
+      return {
+        success: false,
+        statusCode: 400,
+        error: `Unknown Playwright action: ${action}`,
+      };
     }
 
     try {
       // Call Playwright MCP server directly via HTTP
       // Default Playwright MCP runs on port 3001
-      const mcpResponse = await fetch("http://127.0.0.1:3001/call", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          tool: mcpTool.replace("mcp_playwright_", ""),
-          arguments: params,
-        }),
-      });
+      const mcpResponse = await this.fetchWithTimeout(
+        "http://127.0.0.1:3001/call",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            tool: mcpTool.replace("mcp_playwright_", ""),
+            arguments: params,
+          }),
+        },
+        10000,
+      );
 
       if (!mcpResponse.ok) {
         const errorText = await mcpResponse.text();
         console.error(`MCP call failed: ${mcpResponse.status} ${errorText}`);
         return {
           success: false,
+          statusCode: 502,
           error: `MCP error: ${mcpResponse.status} - ${errorText}`,
         };
       }
@@ -326,8 +841,10 @@ export class BridgeServer {
       console.error(`MCP tool execution failed for ${action}:`, error);
 
       // Return a graceful error
+      const isTimeout = error instanceof Error && error.name === "AbortError";
       return {
         success: false,
+        statusCode: isTimeout ? 504 : 503,
         error: `Failed to execute ${action}: ${error instanceof Error ? error.message : "Unknown error"}`,
       };
     }

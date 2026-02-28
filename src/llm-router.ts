@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import * as path from "path";
 
 export interface LLMSettings {
   provider: "copilot" | "copilot-agent" | "lm-studio";
@@ -72,8 +73,7 @@ export class LLMRouter {
   }
 
   async chat(request: ChatRequest): Promise<AsyncIterable<string>> {
-    const { settings, messages, pageContent, screenshot, operationMode } =
-      request;
+    const { settings, messages, pageContent, screenshot } = request;
 
     // Build system prompt with page content
     const systemPrompt = this.buildSystemPrompt(pageContent);
@@ -495,9 +495,6 @@ ${pageContent ? `## 📄 現在のWebページ:\n${pageContent.slice(0, 12000)}`
           }
         } else {
           console.log(`[Screenshot] Raw base64 data, assuming ${mimeType}`);
-          console.log(
-            `[Screenshot] First 50 chars: ${normalizedScreenshot.substring(0, 50)}`,
-          );
         }
 
         // Remove whitespace/newlines from base64 data if any
@@ -563,7 +560,7 @@ ${pageContent ? `## 📄 現在のWebページ:\n${pageContent.slice(0, 12000)}`
           chatMessages.push(
             vscode.LanguageModelChatMessage.User(agentSystemPrompt),
           );
-        } else if (!detectedMime || (!isJpeg && !isPng)) {
+        } else if (!detectedMime || (!isJpeg && !isPng && !isWebp)) {
           console.error(
             "Screenshot format unsupported or invalid, skipping image",
           );
@@ -760,49 +757,91 @@ ${pageContent ? `## 📄 現在のWebページ:\n${pageContent.slice(0, 12000)}`
     try {
       switch (name) {
         case "search_workspace": {
-          const query = params.query as string;
+          const query = String(params.query ?? "")
+            .trim()
+            .toLowerCase();
+          const filePattern =
+            typeof params.filePattern === "string" &&
+            params.filePattern.trim().length > 0
+              ? params.filePattern
+              : "**/*";
           const files = await vscode.workspace.findFiles(
-            (params.filePattern as string) || "**/*",
+            filePattern,
             "**/node_modules/**",
-            20,
+            200,
           );
-          const results = files
-            .map((f) => vscode.workspace.asRelativePath(f))
-            .join("\n");
+
+          const relativeFiles = files.map((f) =>
+            vscode.workspace.asRelativePath(f),
+          );
+          const filteredFiles = query
+            ? relativeFiles.filter((file) => file.toLowerCase().includes(query))
+            : relativeFiles;
+
+          const results = filteredFiles.slice(0, 20).join("\n");
           return {
             success: true,
-            result: `見つかったファイル:\n${results || "なし"}`,
+            result: `見つかったファイル(${filteredFiles.length}件):\n${results || "なし"}`,
           };
         }
 
         case "read_file": {
-          const path = params.path as string;
-          const workspaceFolders = vscode.workspace.workspaceFolders;
-          if (!workspaceFolders) {
+          const requestedPath = params.path;
+          const fileUri = this.toWorkspaceFileUri(requestedPath);
+          if (!fileUri) {
             return {
               success: false,
-              result: "ワークスペースが開かれていません",
+              result:
+                "無効なファイルパスです（ワークスペース外は読み取れません）",
             };
           }
-          const uri = vscode.Uri.joinPath(workspaceFolders[0].uri, path);
-          const content = await vscode.workspace.fs.readFile(uri);
+
+          const content = await vscode.workspace.fs.readFile(fileUri);
           const text = new TextDecoder().decode(content);
           return { success: true, result: text.slice(0, 3000) };
         }
 
         case "create_file": {
-          const path = params.path as string;
-          const content = params.content as string;
+          const filePath = params.path;
+          if (!this.isSafeRelativePath(filePath)) {
+            return {
+              success: false,
+              result: "無効なファイルパスです（相対パスのみ使用可能）",
+            };
+          }
+          if (typeof params.content !== "string") {
+            return {
+              success: false,
+              result: "無効なファイル内容です（文字列のみ使用可能）",
+            };
+          }
+
+          const content = params.content;
           // Encode content as base64 to avoid delimiter issues
           const b64 = Buffer.from(content, "utf-8").toString("base64");
           return {
             success: true,
-            result: `__DOWNLOAD_FILE__:${path}:${b64}:__END_DOWNLOAD__`,
+            result: `__DOWNLOAD_FILE__:${filePath}:${b64}:__END_DOWNLOAD__`,
           };
         }
 
         case "run_terminal": {
-          const command = params.command as string;
+          if (!this.isAgentTerminalToolEnabled()) {
+            return {
+              success: false,
+              result:
+                "run_terminal は無効です。設定 copilotBrowserBridge.enableAgentTerminalTool を true にしてください。",
+            };
+          }
+
+          const command =
+            typeof params.command === "string" ? params.command.trim() : "";
+          if (!command) {
+            return {
+              success: false,
+              result: "無効なコマンドです（空文字は実行できません）",
+            };
+          }
           const terminal = vscode.window.createTerminal("Agent");
           terminal.show();
           terminal.sendText(command);
@@ -813,9 +852,18 @@ ${pageContent ? `## 📄 現在のWebページ:\n${pageContent.slice(0, 12000)}`
         }
 
         case "browser_action": {
-          const action = params.action as string;
-          const selector = (params.selector as string) || "";
-          const value = (params.value as string) || "";
+          const action =
+            typeof params.action === "string" ? params.action.trim() : "";
+          const selector =
+            typeof params.selector === "string" ? params.selector : "";
+          const value = typeof params.value === "string" ? params.value : "";
+
+          if (!action) {
+            return {
+              success: false,
+              result: "無効なbrowser_actionです（actionが必要です）",
+            };
+          }
 
           // Generate proper ACTION format for Chrome extension to parse
           let actionCommand = "";
@@ -860,6 +908,56 @@ ${pageContent ? `## 📄 現在のWebページ:\n${pageContent.slice(0, 12000)}`
         result: `ツール実行エラー: ${error instanceof Error ? error.message : String(error)}`,
       };
     }
+  }
+
+  private isAgentTerminalToolEnabled(): boolean {
+    return vscode.workspace
+      .getConfiguration("copilotBrowserBridge")
+      .get<boolean>("enableAgentTerminalTool", false);
+  }
+
+  private isSafeRelativePath(inputPath: unknown): inputPath is string {
+    if (typeof inputPath !== "string") {
+      return false;
+    }
+
+    const normalized = inputPath.replace(/\\/g, "/").trim();
+    if (!normalized) {
+      return false;
+    }
+
+    if (
+      normalized.startsWith("/") ||
+      normalized.includes("://") ||
+      normalized.includes(":")
+    ) {
+      return false;
+    }
+
+    const segments = normalized.split("/").filter(Boolean);
+    return !segments.some((segment) => segment === "." || segment === "..");
+  }
+
+  private toWorkspaceFileUri(relativePath: unknown): vscode.Uri | null {
+    const workspace = vscode.workspace.workspaceFolders?.[0];
+    if (!workspace || !this.isSafeRelativePath(relativePath)) {
+      return null;
+    }
+
+    const segments = relativePath
+      .replace(/\\/g, "/")
+      .split("/")
+      .filter(Boolean);
+    const fileUri = vscode.Uri.joinPath(workspace.uri, ...segments);
+
+    const workspacePath = path.resolve(workspace.uri.fsPath).toLowerCase();
+    const targetPath = path.resolve(fileUri.fsPath).toLowerCase();
+
+    const isWithinWorkspace =
+      targetPath === workspacePath ||
+      targetPath.startsWith(`${workspacePath}${path.sep.toLowerCase()}`);
+
+    return isWithinWorkspace ? fileUri : null;
   }
 
   private async *chatWithLMStudio(

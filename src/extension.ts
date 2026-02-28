@@ -8,25 +8,31 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Commands
   context.subscriptions.push(
-    vscode.commands.registerCommand("copilotBrowserBridge.startServer", () => {
-      startServer();
-    }),
+    vscode.commands.registerCommand(
+      "copilotBrowserBridge.startServer",
+      async () => {
+        await startServer();
+      },
+    ),
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("copilotBrowserBridge.stopServer", () => {
-      stopServer();
-    }),
+    vscode.commands.registerCommand(
+      "copilotBrowserBridge.stopServer",
+      async () => {
+        stopServer();
+      },
+    ),
   );
 
   // Auto-start if configured
   const config = vscode.workspace.getConfiguration("copilotBrowserBridge");
   if (config.get("autoStart", true)) {
-    startServer();
+    void startServer();
   }
 }
 
-function startServer() {
+async function startServer(): Promise<void> {
   if (server) {
     vscode.window.showInformationMessage(
       "Copilot Browser Bridge: Server is already running",
@@ -38,11 +44,19 @@ function startServer() {
   const port = config.get("serverPort", 3210);
 
   server = new BridgeServer(port);
-  server.start();
 
-  vscode.window.showInformationMessage(
-    `Copilot Browser Bridge: Server started on port ${port}`,
-  );
+  try {
+    await server.start();
+    vscode.window.showInformationMessage(
+      `Copilot Browser Bridge: Server started on port ${port}`,
+    );
+  } catch (error) {
+    server = undefined;
+    const message = error instanceof Error ? error.message : String(error);
+    vscode.window.showErrorMessage(
+      `Copilot Browser Bridge: Failed to start server (${message})`,
+    );
+  }
 }
 
 function stopServer() {

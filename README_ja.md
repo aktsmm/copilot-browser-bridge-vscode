@@ -52,10 +52,12 @@ ext install yamapan.copilot-browser-bridge-vscode
 
 ## ⚙️ 設定
 
-| 設定                              | デフォルト | 説明                                |
-| --------------------------------- | ---------- | ----------------------------------- |
-| `copilotBrowserBridge.serverPort` | 3210       | ローカルサーバーのポート番号        |
-| `copilotBrowserBridge.autoStart`  | true       | VS Code起動時に自動でサーバーを開始 |
+| 設定                                           | デフォルト | 説明                                          |
+| ---------------------------------------------- | ---------- | --------------------------------------------- |
+| `copilotBrowserBridge.serverPort`              | 3210       | ローカルサーバーのポート番号                  |
+| `copilotBrowserBridge.autoStart`               | true       | VS Code起動時に自動でサーバーを開始           |
+| `copilotBrowserBridge.enableAgentTerminalTool` | false      | エージェントの `run_terminal` 実行を許可      |
+| `copilotBrowserBridge.allowedExtensionOrigins` | []         | 追加で許可する `chrome-extension://` オリジン |
 
 ## 🔧 開発
 

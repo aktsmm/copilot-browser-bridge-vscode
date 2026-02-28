@@ -41,6 +41,19 @@
           "type": "boolean",
           "default": true,
           "description": "Automatically start server on VS Code startup"
+        },
+        "copilotBrowserBridge.enableAgentTerminalTool": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow copilot-agent tool calls to execute terminal commands"
+        },
+        "copilotBrowserBridge.allowedExtensionOrigins": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional allowed chrome-extension:// origins (official store origin is always allowed)"
         }
       }
     }
