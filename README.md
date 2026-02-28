@@ -11,8 +11,8 @@
 [Japanese / 日本語版はこちら](README_ja.md)
 
 ## License
-CC BY-NC-SA 4.0 — see [LICENSE](LICENSE).
 
+CC BY-NC-SA 4.0 — see [LICENSE](LICENSE).
 
 ## 📥 Installation
 
