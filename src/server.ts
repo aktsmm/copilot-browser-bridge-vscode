@@ -1,7 +1,7 @@
 import * as http from "http";
-import * as path from "path";
 import * as vscode from "vscode";
 import { LLMRouter, ChatRequest } from "./llm-router";
+import { isSafeRelativePath, toWorkspaceFileUri } from "./path-safety";
 
 type ValidationResult<T> =
   | { ok: true; value: T }
@@ -15,10 +15,12 @@ export class BridgeServer {
   private server: http.Server | null = null;
   private port: number;
   private llmRouter: LLMRouter;
+  private extensionVersion: string;
 
-  constructor(port: number) {
+  constructor(port: number, extensionVersion: string) {
     this.port = port;
     this.llmRouter = new LLMRouter();
+    this.extensionVersion = extensionVersion;
   }
 
   start(): Promise<void> {
@@ -171,7 +173,7 @@ export class BridgeServer {
 
   private async handleHealth(res: http.ServerResponse): Promise<void> {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", version: "0.1.0" }));
+    res.end(JSON.stringify({ status: "ok", version: this.extensionVersion }));
   }
 
   private async handleModels(res: http.ServerResponse): Promise<void> {
@@ -198,14 +200,6 @@ export class BridgeServer {
 
     const request = validation.value;
 
-    // Debug: Log screenshot info
-    console.log(`[Server] handleChat called`);
-    console.log(`[Server] Provider: ${request.settings?.provider}`);
-    console.log(`[Server] Screenshot present: ${!!request.screenshot}`);
-    if (request.screenshot) {
-      console.log(`[Server] Screenshot length: ${request.screenshot.length}`);
-    }
-
     // Set streaming headers
     res.writeHead(200, {
       "Content-Type": "text/plain; charset=utf-8",
@@ -213,20 +207,47 @@ export class BridgeServer {
       "Cache-Control": "no-cache",
     });
 
+    const chatAbortController = new AbortController();
+    const handleRequestAbort = () => {
+      chatAbortController.abort();
+    };
+    req.on("aborted", handleRequestAbort);
+    req.on("close", handleRequestAbort);
+
     try {
-      const stream = await this.llmRouter.chat(request);
+      const stream = await this.llmRouter.chat(
+        request,
+        chatAbortController.signal,
+      );
 
       for await (const chunk of stream) {
+        if (chatAbortController.signal.aborted || res.destroyed) {
+          break;
+        }
         res.write(chunk);
       }
 
-      res.end();
+      if (!res.writableEnded && !res.destroyed) {
+        res.end();
+      }
     } catch (error) {
+      if (chatAbortController.signal.aborted) {
+        if (!res.writableEnded && !res.destroyed) {
+          res.end();
+        }
+        return;
+      }
+
       console.error("Chat error:", error);
-      res.write(
-        `\n\nエラー: ${error instanceof Error ? error.message : "Unknown error"}`,
-      );
-      res.end();
+      if (!res.writableEnded && !res.destroyed) {
+        res.write(
+          `\n\nエラー: ${error instanceof Error ? error.message : "Unknown error"}`,
+        );
+        res.end();
+      }
+    } finally {
+      req.removeListener("aborted", handleRequestAbort);
+      req.removeListener("close", handleRequestAbort);
     }
   }
 
@@ -445,44 +466,6 @@ export class BridgeServer {
     };
   }
 
-  private isSafeRelativePath(inputPath: unknown): boolean {
-    if (typeof inputPath !== "string" || !inputPath.trim()) {
-      return false;
-    }
-
-    const normalized = inputPath.replace(/\\/g, "/").trim();
-    if (
-      normalized.startsWith("/") ||
-      normalized.includes("://") ||
-      normalized.includes(":")
-    ) {
-      return false;
-    }
-
-    if (normalized.endsWith("/")) {
-      return false;
-    }
-
-    const segments = normalized.split("/");
-    if (segments.some((segment) => segment.length === 0)) {
-      return false;
-    }
-
-    return !segments.some((segment) => segment === ".." || segment === ".");
-  }
-
-  private isWithinWorkspace(
-    workspaceUri: vscode.Uri,
-    targetUri: vscode.Uri,
-  ): boolean {
-    const workspacePath = path.resolve(workspaceUri.fsPath).toLowerCase();
-    const targetPath = path.resolve(targetUri.fsPath).toLowerCase();
-    return (
-      targetPath === workspacePath ||
-      targetPath.startsWith(`${workspacePath}${path.sep.toLowerCase()}`)
-    );
-  }
-
   private getParentDirectoryUri(
     workspaceUri: vscode.Uri,
     relativePath: string,
@@ -556,16 +539,14 @@ export class BridgeServer {
       }
 
       const workspaceUri = workspaceFolders[0].uri;
-      if (!this.isSafeRelativePath(filePath)) {
+      if (!isSafeRelativePath(filePath)) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Invalid file path" }));
         return;
       }
 
-      const pathSegments = filePath.replace(/\\/g, "/").split("/");
-      const fileUri = vscode.Uri.joinPath(workspaceUri, ...pathSegments);
-
-      if (!this.isWithinWorkspace(workspaceUri, fileUri)) {
+      const fileUri = toWorkspaceFileUri(workspaceUri, filePath);
+      if (!fileUri) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Path escapes workspace" }));
         return;
@@ -577,6 +558,12 @@ export class BridgeServer {
           if (existing && !this.isRegularFile(existing.type)) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "Target path is not a file" }));
+            break;
+          }
+
+          if (existing && this.isRegularFile(existing.type)) {
+            res.writeHead(409, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "File already exists" }));
             break;
           }
 
@@ -666,7 +653,7 @@ export class BridgeServer {
 
           await vscode.workspace.fs.delete(fileUri, {
             recursive: false,
-            useTrash: false,
+            useTrash: true,
           });
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
@@ -698,7 +685,7 @@ export class BridgeServer {
   ): Promise<void> {
     const available = await this.isPlaywrightMcpAvailable();
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ available, version: "1.0.0" }));
+    res.end(JSON.stringify({ available, version: this.extensionVersion }));
   }
 
   private async isPlaywrightMcpAvailable(): Promise<boolean> {
@@ -767,6 +754,25 @@ export class BridgeServer {
     }
   }
 
+  private async closeCurrentPlaywrightTabBestEffort(): Promise<void> {
+    try {
+      await this.fetchWithTimeout(
+        "http://127.0.0.1:3001/call",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            tool: "browser_tabs",
+            arguments: { action: "close" },
+          }),
+        },
+        5000,
+      );
+    } catch (error) {
+      console.warn("Failed to rollback tab after navigate error:", error);
+    }
+  }
+
   private async executePlaywrightMcpAction(
     action: string,
     params: Record<string, unknown>,
@@ -806,6 +812,73 @@ export class BridgeServer {
     }
 
     try {
+      const tabAction =
+        action === "browser_tabs" && typeof params.action === "string"
+          ? params.action.trim()
+          : "";
+      const tabUrl =
+        action === "browser_tabs" && typeof params.url === "string"
+          ? params.url.trim()
+          : "";
+
+      if (tabAction === "new" && tabUrl.length > 0) {
+        const openTabResponse = await this.fetchWithTimeout(
+          "http://127.0.0.1:3001/call",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              tool: "browser_tabs",
+              arguments: { action: "new" },
+            }),
+          },
+          10000,
+        );
+
+        if (!openTabResponse.ok) {
+          const errorText = await openTabResponse.text();
+          return {
+            success: false,
+            statusCode: 502,
+            error: `MCP error: ${openTabResponse.status} - ${errorText}`,
+          };
+        }
+
+        const navigateResponse = await this.fetchWithTimeout(
+          "http://127.0.0.1:3001/call",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              tool: "browser_navigate",
+              arguments: { url: tabUrl },
+            }),
+          },
+          10000,
+        );
+
+        if (!navigateResponse.ok) {
+          const errorText = await navigateResponse.text();
+          await this.closeCurrentPlaywrightTabBestEffort();
+          return {
+            success: false,
+            statusCode: 502,
+            error: `MCP error: ${navigateResponse.status} - ${errorText}`,
+          };
+        }
+
+        const openTabResult = await openTabResponse.json();
+        const navigateResult = await navigateResponse.json();
+        return {
+          success: true,
+          message: `Executed ${action}`,
+          data: {
+            openTab: openTabResult,
+            navigate: navigateResult,
+          },
+        };
+      }
+
       // Call Playwright MCP server directly via HTTP
       // Default Playwright MCP runs on port 3001
       const mcpResponse = await this.fetchWithTimeout(

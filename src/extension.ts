@@ -2,9 +2,15 @@ import * as vscode from "vscode";
 import { BridgeServer } from "./server";
 
 let server: BridgeServer | undefined;
+let extensionVersion = "unknown";
 
 export function activate(context: vscode.ExtensionContext) {
   console.log("Copilot Browser Bridge: Extension activated");
+  const packageVersion = context.extension.packageJSON?.version;
+  extensionVersion =
+    typeof packageVersion === "string" && packageVersion.trim().length > 0
+      ? packageVersion
+      : "unknown";
 
   // Commands
   context.subscriptions.push(
@@ -43,7 +49,7 @@ async function startServer(): Promise<void> {
   const config = vscode.workspace.getConfiguration("copilotBrowserBridge");
   const port = config.get("serverPort", 3210);
 
-  server = new BridgeServer(port);
+  server = new BridgeServer(port, extensionVersion);
 
   try {
     await server.start();

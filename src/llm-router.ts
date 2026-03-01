@@ -1,5 +1,8 @@
 import * as vscode from "vscode";
-import * as path from "path";
+import {
+  isSafeRelativePath,
+  toWorkspaceFileUri as toWorkspaceFileUriShared,
+} from "./path-safety";
 
 export interface LLMSettings {
   provider: "copilot" | "copilot-agent" | "lm-studio";
@@ -43,6 +46,29 @@ interface ToolResult {
 }
 
 export class LLMRouter {
+  private bindAbortSignal(
+    signal: AbortSignal | undefined,
+    onAbort: () => void,
+  ): () => void {
+    if (!signal) {
+      return () => {};
+    }
+
+    if (signal.aborted) {
+      onAbort();
+      return () => {};
+    }
+
+    const handler = () => {
+      onAbort();
+    };
+    signal.addEventListener("abort", handler, { once: true });
+
+    return () => {
+      signal.removeEventListener("abort", handler);
+    };
+  }
+
   async getAvailableModels(): Promise<ModelInfo[]> {
     const models: ModelInfo[] = [];
 
@@ -72,7 +98,10 @@ export class LLMRouter {
     return models;
   }
 
-  async chat(request: ChatRequest): Promise<AsyncIterable<string>> {
+  async chat(
+    request: ChatRequest,
+    abortSignal?: AbortSignal,
+  ): Promise<AsyncIterable<string>> {
     const { settings, messages, pageContent, screenshot } = request;
 
     // Build system prompt with page content
@@ -84,6 +113,7 @@ export class LLMRouter {
         systemPrompt,
         messages,
         screenshot,
+        abortSignal,
       );
     } else if (settings.provider === "copilot-agent") {
       return this.chatWithCopilotAgent(
@@ -91,9 +121,15 @@ export class LLMRouter {
         pageContent,
         messages,
         screenshot,
+        abortSignal,
       );
     } else {
-      return this.chatWithLMStudio(settings.lmStudio, systemPrompt, messages);
+      return this.chatWithLMStudio(
+        settings.lmStudio,
+        systemPrompt,
+        messages,
+        abortSignal,
+      );
     }
   }
 
@@ -184,11 +220,133 @@ ${browserActionsDoc}
 ユーザーと同じ言語で応答してください。`;
   }
 
+  private buildAgentSystemPrompt(
+    pageContent: string,
+    screenshotMode: boolean,
+  ): string {
+    const currentStateAnalysis = screenshotMode
+      ? "2. **現状分析**: スクリーンショットとDOM要素から、今どの段階にいるか？"
+      : "2. **現状分析**: ページスナップショットから、今どの段階にいるか？";
+
+    const elementIdentification = screenshotMode
+      ? `## 📍 要素の特定方法（優先順位）
+1. **[eXX] ref番号** ← 最も確実。必ずこれを使う
+2. **テキストマッチ** ← ref番号がない場合のみ
+
+例:
+[e5] button "次へ" → [ACTION: click, e5]
+[e12] radio "そう思わない" → [ACTION: click, e12]`
+      : `## 📍 要素の特定方法
+ページスナップショットの各要素には [eXX] という参照番号があります。
+これを使って確実にクリックします。
+
+例:
+[e5] button "次へ" → [ACTION: click, e5]
+[e12] input "検索" → [ACTION: type, e12, 検索ワード]`;
+
+    const fileOperationSection = screenshotMode
+      ? ""
+      : `
+## 📁 ファイル操作の活用
+調査結果やデータを保存するときに使用:
+
+[FILE: create, output/report.md, # 調査レポート
+## 概要
+ここに要約...
+
+## 詳細
+ここに詳細...
+]`;
+
+    const successDefinitionSection = screenshotMode
+      ? ""
+      : `
+## 🏆 成功の定義
+タスクが完了したら、以下を報告:
+1. 何を達成したか
+2. 重要な発見や注意点
+3. 次のアクション（あれば）`;
+
+    const pageSection = pageContent
+      ? screenshotMode
+        ? `\n## 📄 現在のページ情報:\n${pageContent.slice(0, 10000)}`
+        : `\n## 📄 現在のWebページ:\n${pageContent.slice(0, 12000)}`
+      : "";
+
+    return `あなたは「ユーザーの右腕」として働く、超有能なブラウザ操作AIエージェントです。
+ユーザーが達成したいゴールを深く理解し、自律的に考え、確実に実行します。
+
+## 🎯 あなたの使命
+- ユーザーの意図を先読みし、期待以上の結果を出す
+- 困難な状況でも諦めず、創造的な解決策を見つける
+- 進捗を分かりやすく報告し、ユーザーを安心させる
+
+## 🔍 調査タスクの実行方法（超重要！）
+「調べて」「探して」「検索して」と言われたら、以下を**必ず最後まで**実行:
+
+1. **検索実行**: Google等で検索 [ACTION: navigate, https://www.google.com/search?q=検索ワード]
+2. **結果を読む**: 検索結果ページの内容を確認
+3. **詳細を調査**: 有用そうなリンクをクリックして詳細を読む
+4. **情報を収集**: 複数のソースから情報を集める
+5. **回答をまとめる**: 収集した情報を整理して**最終的な回答**を提供
+
+❌ ダメな例: 「〜で検索できます」「〜を調べてみてください」で終わる
+✅ 良い例: 実際に検索し、結果を読み、「調査の結果、〜ということが分かりました」と回答
+
+## 🧠 思考プロセス（必ず実行）
+1. **ゴール理解**: ユーザーは最終的に何を達成したいのか？
+${currentStateAnalysis}
+3. **計画立案**: ゴールまでの最短・最確実なステップは？
+4. **リスク予測**: 何が失敗しそうか？代替案は？
+5. **実行**: 1ステップずつ確実に実行
+
+${elementIdentification}
+
+## 🔧 アクション形式
+\`\`\`
+[ACTION: click, eXX]           # 要素をクリック
+[ACTION: type, eXX, テキスト]   # テキスト入力
+[ACTION: scroll, down/up]      # スクロール
+[ACTION: navigate, URL]        # URL移動
+[ACTION: screenshot]           # 最新状態を確認
+[ACTION: radio, eXX]           # ラジオボタン選択（重要！）
+[ACTION: select, eXX, 値]       # ドロップダウン選択
+[ACTION: slider, eXX, 50]      # スライダー値設定（0-100）
+[ACTION: hover, eXX]           # ホバー
+[FILE: create, パス, 内容]      # ファイル作成
+[FILE: append, パス, 内容]      # ファイル追記
+\`\`\`
+
+## 📝 フォーム操作のコツ
+- **ラジオボタン**: role="radio" の要素を [ACTION: radio, eXX] でクリック
+- **チェックボックス**: [ACTION: click, eXX] でトグル
+- **ドロップダウン**: [ACTION: select, eXX, 選択肢テキスト]
+- **スライダー**: [ACTION: slider, eXX, 値]
+${fileOperationSection}
+
+## 💡 プロとしての行動指針
+- **最後までやり遂げる**: 途中で投げ出さない。結果を出すまで続ける
+- **先回り**: 「次は何が必要か」を常に考える
+- **報告**: 「今これをしています」「次はこれをします」と明確に伝える
+- **確認**: 重要な操作の前は「〜してよろしいですか？」と確認
+- **エラー対応**: 失敗したら原因を分析し、別のアプローチを試す
+- **完了報告**: 何を達成したか、結果はどうだったかを簡潔に報告
+
+## 🚨 トラブル時の対応
+- 要素が見つからない → スクロールして探す、または別のセレクタを試す
+- ページが読み込み中 → 少し待ってからスクリーンショットで確認
+- 予期せぬポップアップ → 閉じるか、内容を確認して対処
+- 操作がブロックされた → ユーザーに状況を報告し、代替案を提案
+${successDefinitionSection}
+${pageSection}`;
+  }
+
   private async *chatWithCopilot(
     modelFamily: string,
     systemPrompt: string,
     messages: ChatMessage[],
     screenshot?: string,
+    abortSignal?: AbortSignal,
   ): AsyncIterable<string> {
     try {
       // Try to find model by family first
@@ -239,14 +397,23 @@ ${browserActionsDoc}
         ),
       ];
 
-      const response = await model.sendRequest(
-        chatMessages,
-        {},
-        new vscode.CancellationTokenSource().token,
-      );
+      const tokenSource = new vscode.CancellationTokenSource();
+      const unbindAbort = this.bindAbortSignal(abortSignal, () => {
+        tokenSource.cancel();
+      });
+      try {
+        const response = await model.sendRequest(
+          chatMessages,
+          {},
+          tokenSource.token,
+        );
 
-      for await (const chunk of response.text) {
-        yield chunk;
+        for await (const chunk of response.text) {
+          yield chunk;
+        }
+      } finally {
+        unbindAbort();
+        tokenSource.dispose();
       }
     } catch (error) {
       if (error instanceof vscode.LanguageModelError) {
@@ -267,6 +434,7 @@ ${browserActionsDoc}
     pageContent: string,
     messages: ChatMessage[],
     screenshot?: string,
+    abortSignal?: AbortSignal,
   ): AsyncIterable<string> {
     try {
       // Use the selected model for agent mode
@@ -303,167 +471,10 @@ ${browserActionsDoc}
 
       // Build agent system prompt based on whether screenshot is available
       const screenshotMode = !!screenshot;
-
-      const agentSystemPrompt = screenshotMode
-        ? `あなたは「ユーザーの右腕」として働く、超有能なブラウザ操作AIエージェントです。
-ユーザーが達成したいゴールを深く理解し、自律的に考え、確実に実行します。
-
-## 🎯 あなたの使命
-- ユーザーの意図を先読みし、期待以上の結果を出す
-- 困難な状況でも諦めず、創造的な解決策を見つける
-- 進捗を分かりやすく報告し、ユーザーを安心させる
-
-## 🔍 調査タスクの実行方法（超重要！）
-「調べて」「探して」「検索して」と言われたら、以下を**必ず最後まで**実行:
-
-1. **検索実行**: Google等で検索 [ACTION: navigate, https://www.google.com/search?q=検索ワード]
-2. **結果を読む**: 検索結果ページの内容を確認
-3. **詳細を調査**: 有用そうなリンクをクリックして詳細を読む
-4. **情報を収集**: 複数のソースから情報を集める
-5. **回答をまとめる**: 収集した情報を整理して**最終的な回答**を提供
-
-❌ ダメな例: 「〜で検索できます」「〜を調べてみてください」で終わる
-✅ 良い例: 実際に検索し、結果を読み、「調査の結果、〜ということが分かりました」と回答
-
-## 🧠 思考プロセス（必ず実行）
-1. **ゴール理解**: ユーザーは最終的に何を達成したいのか？
-2. **現状分析**: スクリーンショットとDOM要素から、今どの段階にいるか？
-3. **計画立案**: ゴールまでの最短・最確実なステップは？
-4. **リスク予測**: 何が失敗しそうか？代替案は？
-5. **実行**: 1ステップずつ確実に実行
-
-## 📍 要素の特定方法（優先順位）
-1. **[eXX] ref番号** ← 最も確実。必ずこれを使う
-2. **テキストマッチ** ← ref番号がない場合のみ
-
-例:
-[e5] button "次へ" → [ACTION: click, e5]
-[e12] radio "そう思わない" → [ACTION: click, e12]
-
-## 🔧 アクション形式
-\`\`\`
-[ACTION: click, eXX]           # 要素をクリック
-[ACTION: type, eXX, テキスト]   # テキスト入力
-[ACTION: scroll, down/up]      # スクロール
-[ACTION: navigate, URL]        # URL移動
-[ACTION: screenshot]           # 最新状態を確認
-[ACTION: radio, eXX]           # ラジオボタン選択（重要！）
-[ACTION: select, eXX, 値]       # ドロップダウン選択
-[ACTION: slider, eXX, 50]      # スライダー値設定（0-100）
-[ACTION: hover, eXX]           # ホバー
-[FILE: create, パス, 内容]      # ファイル作成
-[FILE: append, パス, 内容]      # ファイル追記
-\`\`\`
-
-## 📝 フォーム操作のコツ
-- **ラジオボタン**: role="radio" の要素を [ACTION: radio, eXX] でクリック
-- **チェックボックス**: [ACTION: click, eXX] でトグル
-- **ドロップダウン**: [ACTION: select, eXX, 選択肢テキスト]
-- **スライダー**: [ACTION: slider, eXX, 値]
-
-## 💡 プロとしての行動指針
-- **最後までやり遂げる**: 途中で投げ出さない。結果を出すまで続ける
-- **先回り**: 「次は何が必要か」を常に考える
-- **報告**: 「今これをしています」「次はこれをします」と明確に伝える
-- **確認**: 重要な操作の前は「〜してよろしいですか？」と確認
-- **エラー対応**: 失敗したら原因を分析し、別のアプローチを試す
-- **完了報告**: 何を達成したか、結果はどうだったかを簡潔に報告
-
-## 🚨 トラブル時の対応
-- 要素が見つからない → スクロールして探す、または別のセレクタを試す
-- ページが読み込み中 → 少し待ってからスクリーンショットで確認
-- 予期せぬポップアップ → 閉じるか、内容を確認して対処
-- 操作がブロックされた → ユーザーに状況を報告し、代替案を提案
-
-${pageContent ? `## 📄 現在のページ情報:\n${pageContent.slice(0, 10000)}` : ""}`
-        : `あなたは「ユーザーの右腕」として働く、超有能なブラウザ操作AIエージェントです。
-ユーザーが達成したいゴールを深く理解し、自律的に考え、確実に実行します。
-
-## 🎯 あなたの使命
-- ユーザーの意図を先読みし、期待以上の結果を出す
-- 困難な状況でも諦めず、創造的な解決策を見つける
-- 進捗を分かりやすく報告し、ユーザーを安心させる
-
-## 🔍 調査タスクの実行方法（超重要！）
-「調べて」「探して」「検索して」と言われたら、以下を**必ず最後まで**実行:
-
-1. **検索実行**: Google等で検索 [ACTION: navigate, https://www.google.com/search?q=検索ワード]
-2. **結果を読む**: 検索結果ページの内容を確認
-3. **詳細を調査**: 有用そうなリンクをクリックして詳細を読む
-4. **情報を収集**: 複数のソースから情報を集める
-5. **回答をまとめる**: 収集した情報を整理して**最終的な回答**を提供
-
-❌ ダメな例: 「〜で検索できます」「〜を調べてみてください」で終わる
-✅ 良い例: 実際に検索し、結果を読み、「調査の結果、〜ということが分かりました」と回答
-
-## 🧠 思考プロセス（必ず実行）
-1. **ゴール理解**: ユーザーは最終的に何を達成したいのか？
-2. **現状分析**: ページスナップショットから、今どの段階にいるか？
-3. **計画立案**: ゴールまでの最短・最確実なステップは？
-4. **リスク予測**: 何が失敗しそうか？代替案は？
-5. **実行**: 1ステップずつ確実に実行
-
-## 📍 要素の特定方法
-ページスナップショットの各要素には [eXX] という参照番号があります。
-これを使って確実にクリックします。
-
-例:
-[e5] button "次へ" → [ACTION: click, e5]
-[e12] input "検索" → [ACTION: type, e12, 検索ワード]
-
-## 🔧 アクション形式
-\`\`\`
-[ACTION: click, eXX]           # 要素をクリック
-[ACTION: type, eXX, テキスト]   # テキスト入力
-[ACTION: scroll, down/up]      # スクロール
-[ACTION: navigate, URL]        # URL移動
-[ACTION: screenshot]           # 最新状態を確認
-[ACTION: radio, eXX]           # ラジオボタン選択（重要！）
-[ACTION: select, eXX, 値]       # ドロップダウン選択
-[ACTION: slider, eXX, 50]      # スライダー値設定（0-100）
-[ACTION: hover, eXX]           # ホバー
-[FILE: create, パス, 内容]      # ファイル作成
-[FILE: append, パス, 内容]      # ファイル追記
-\`\`\`
-
-## 📝 フォーム操作のコツ
-- **ラジオボタン**: role="radio" の要素を [ACTION: radio, eXX] でクリック
-- **チェックボックス**: [ACTION: click, eXX] でトグル
-- **ドロップダウン**: [ACTION: select, eXX, 選択肢テキスト]
-- **スライダー**: [ACTION: slider, eXX, 値]
-
-## 📁 ファイル操作の活用
-調査結果やデータを保存するときに使用:
-
-[FILE: create, output/report.md, # 調査レポート
-## 概要
-ここに要約...
-
-## 詳細
-ここに詳細...
-]
-
-## 💡 プロとしての行動指針
-- **最後までやり遂げる**: 途中で投げ出さない。結果を出すまで続ける
-- **先回り**: 「次は何が必要か」を常に考える
-- **報告**: 「今これをしています」「次はこれをします」と明確に伝える
-- **確認**: 重要な操作の前は「〜してよろしいですか？」と確認
-- **エラー対応**: 失敗したら原因を分析し、別のアプローチを試す
-- **完了報告**: 何を達成したか、結果はどうだったかを簡潔に報告
-
-## 🚨 トラブル時の対応
-- 要素が見つからない → スクロールして探す、または別のセレクタを試す
-- ページが読み込み中 → 少し待ってからスクリーンショットで確認
-- 予期せぬポップアップ → 閉じるか、内容を確認して対処
-- 操作がブロックされた → ユーザーに状況を報告し、代替案を提案
-
-## 🏆 成功の定義
-タスクが完了したら、以下を報告:
-1. 何を達成したか
-2. 重要な発見や注意点
-3. 次のアクション（あれば）
-
-${pageContent ? `## 📄 現在のWebページ:\n${pageContent.slice(0, 12000)}` : ""}`;
+      const agentSystemPrompt = this.buildAgentSystemPrompt(
+        pageContent,
+        screenshotMode,
+      );
 
       // Build chat messages, including screenshot if available
       const chatMessages: vscode.LanguageModelChatMessage[] = [];
@@ -682,57 +693,80 @@ ${pageContent ? `## 📄 現在のWebページ:\n${pageContent.slice(0, 12000)}`
       ];
 
       const tokenSource = new vscode.CancellationTokenSource();
-      let continueLoop = true;
-      let iterationCount = 0;
-      const maxIterations = 5;
+      const unbindAbort = this.bindAbortSignal(abortSignal, () => {
+        tokenSource.cancel();
+      });
+      try {
+        let continueLoop = true;
+        let iterationCount = 0;
+        const maxIterations = 5;
 
-      while (continueLoop && iterationCount < maxIterations) {
-        iterationCount++;
+        while (continueLoop && iterationCount < maxIterations) {
+          iterationCount++;
 
-        const response = await model.sendRequest(
-          chatMessages,
-          { tools },
-          tokenSource.token,
-        );
+          const response = await model.sendRequest(
+            chatMessages,
+            { tools },
+            tokenSource.token,
+          );
 
-        let fullResponse = "";
-        const toolCalls: Array<{ name: string; parameters: unknown }> = [];
+          const toolCalls: Array<{
+            callId: string;
+            name: string;
+            parameters: unknown;
+          }> = [];
 
-        for await (const part of response.stream) {
-          if (part instanceof vscode.LanguageModelTextPart) {
-            fullResponse += part.value;
-            yield part.value;
-          } else if (part instanceof vscode.LanguageModelToolCallPart) {
-            toolCalls.push({
-              name: part.name,
-              parameters: part.input,
-            });
+          for await (const part of response.stream) {
+            if (part instanceof vscode.LanguageModelTextPart) {
+              yield part.value;
+            } else if (part instanceof vscode.LanguageModelToolCallPart) {
+              toolCalls.push({
+                callId: part.callId,
+                name: part.name,
+                parameters: part.input,
+              });
+            }
           }
-        }
 
-        if (toolCalls.length === 0) {
-          continueLoop = false;
-        } else {
-          // Execute tools and add results
-          for (const toolCall of toolCalls) {
-            yield `\n\n🔧 ツール実行: ${toolCall.name}\n`;
-            const result = await this.executeAgentTool(
-              toolCall.name,
-              toolCall.parameters as Record<string, unknown>,
-            );
-            yield `📋 結果: ${result.result}\n`;
+          if (toolCalls.length === 0) {
+            continueLoop = false;
+          } else {
+            // Execute tools and add results
+            const assistantParts: vscode.LanguageModelToolCallPart[] = [];
+            const userResultParts: vscode.LanguageModelToolResultPart[] = [];
 
-            // Add tool result to conversation
+            for (const toolCall of toolCalls) {
+              yield `\n\n🔧 ツール実行: ${toolCall.name}\n`;
+              const result = await this.executeAgentTool(
+                toolCall.name,
+                toolCall.parameters as Record<string, unknown>,
+              );
+              yield `📋 結果: ${result.result}\n`;
+
+              assistantParts.push(
+                new vscode.LanguageModelToolCallPart(
+                  toolCall.callId,
+                  toolCall.name,
+                  toolCall.parameters as object,
+                ),
+              );
+              userResultParts.push(
+                new vscode.LanguageModelToolResultPart(toolCall.callId, [
+                  new vscode.LanguageModelTextPart(result.result),
+                ]),
+              );
+            }
+
+            // Add tool calls + results in proper API format
             chatMessages.push(
-              vscode.LanguageModelChatMessage.Assistant(
-                `ツール ${toolCall.name} を実行しました`,
-              ),
-              vscode.LanguageModelChatMessage.User(
-                `ツール結果: ${result.result}`,
-              ),
+              vscode.LanguageModelChatMessage.Assistant(assistantParts),
+              vscode.LanguageModelChatMessage.User(userResultParts),
             );
           }
         }
+      } finally {
+        unbindAbort();
+        tokenSource.dispose();
       }
     } catch (error) {
       console.error("Agent mode error:", error);
@@ -744,6 +778,8 @@ ${pageContent ? `## 📄 現在のWebページ:\n${pageContent.slice(0, 12000)}`
         "gpt-4o",
         this.buildSystemPrompt(pageContent),
         messages,
+        undefined,
+        abortSignal,
       )) {
         yield chunk;
       }
@@ -803,7 +839,7 @@ ${pageContent ? `## 📄 現在のWebページ:\n${pageContent.slice(0, 12000)}`
 
         case "create_file": {
           const filePath = params.path;
-          if (!this.isSafeRelativePath(filePath)) {
+          if (!isSafeRelativePath(filePath)) {
             return {
               success: false,
               result: "無効なファイルパスです（相対パスのみ使用可能）",
@@ -916,56 +952,23 @@ ${pageContent ? `## 📄 現在のWebページ:\n${pageContent.slice(0, 12000)}`
       .get<boolean>("enableAgentTerminalTool", false);
   }
 
-  private isSafeRelativePath(inputPath: unknown): inputPath is string {
-    if (typeof inputPath !== "string") {
-      return false;
-    }
-
-    const normalized = inputPath.replace(/\\/g, "/").trim();
-    if (!normalized) {
-      return false;
-    }
-
-    if (
-      normalized.startsWith("/") ||
-      normalized.includes("://") ||
-      normalized.includes(":")
-    ) {
-      return false;
-    }
-
-    const segments = normalized.split("/").filter(Boolean);
-    return !segments.some((segment) => segment === "." || segment === "..");
-  }
-
   private toWorkspaceFileUri(relativePath: unknown): vscode.Uri | null {
     const workspace = vscode.workspace.workspaceFolders?.[0];
-    if (!workspace || !this.isSafeRelativePath(relativePath)) {
+    if (!workspace || typeof relativePath !== "string") {
       return null;
     }
 
-    const segments = relativePath
-      .replace(/\\/g, "/")
-      .split("/")
-      .filter(Boolean);
-    const fileUri = vscode.Uri.joinPath(workspace.uri, ...segments);
-
-    const workspacePath = path.resolve(workspace.uri.fsPath).toLowerCase();
-    const targetPath = path.resolve(fileUri.fsPath).toLowerCase();
-
-    const isWithinWorkspace =
-      targetPath === workspacePath ||
-      targetPath.startsWith(`${workspacePath}${path.sep.toLowerCase()}`);
-
-    return isWithinWorkspace ? fileUri : null;
+    return toWorkspaceFileUriShared(workspace.uri, relativePath);
   }
 
   private async *chatWithLMStudio(
     settings: { endpoint: string; model: string },
     systemPrompt: string,
     messages: ChatMessage[],
+    abortSignal?: AbortSignal,
   ): AsyncIterable<string> {
     const endpoint = settings.endpoint || "http://localhost:1234";
+    let timedOut = false;
 
     try {
       // Build OpenAI-compatible request
@@ -978,18 +981,34 @@ ${pageContent ? `## 📄 現在のWebページ:\n${pageContent.slice(0, 12000)}`
       ];
 
       console.log(`LM Studio: Connecting to ${endpoint}/v1/chat/completions`);
-
-      const response = await fetch(`${endpoint}/v1/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: settings.model || "local-model",
-          messages: requestMessages,
-          stream: true,
-        }),
+      const controller = new AbortController();
+      const timeoutMs = 30000;
+      const timeoutHandle = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, timeoutMs);
+      const unbindAbort = this.bindAbortSignal(abortSignal, () => {
+        controller.abort();
       });
+
+      let response: Response;
+      try {
+        response = await fetch(`${endpoint}/v1/chat/completions`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: settings.model || "local-model",
+            messages: requestMessages,
+            stream: true,
+          }),
+          signal: controller.signal,
+        });
+      } finally {
+        unbindAbort();
+        clearTimeout(timeoutHandle);
+      }
 
       console.log(`LM Studio: Response status ${response.status}`);
 
@@ -1001,6 +1020,40 @@ ${pageContent ? `## 📄 現在のWebページ:\n${pageContent.slice(0, 12000)}`
 
       const reader = response.body?.getReader();
       const decoder = new TextDecoder();
+      let pending = "";
+      let streamDone = false;
+      let parseErrorCount = 0;
+
+      const processLine = async function* (
+        line: string,
+      ): AsyncIterable<string> {
+        const normalizedLine = line.trimEnd();
+        if (!normalizedLine.startsWith("data:")) {
+          return;
+        }
+
+        const data = normalizedLine.slice(5).trimStart();
+        if (data === "[DONE]") {
+          streamDone = true;
+          return;
+        }
+
+        try {
+          const parsed = JSON.parse(data);
+          const content = parsed.choices?.[0]?.delta?.content;
+          if (content) {
+            yield content;
+          }
+        } catch {
+          parseErrorCount++;
+          if (parseErrorCount <= 3) {
+            console.warn(
+              `LM Studio: Failed to parse streamed JSON line (${parseErrorCount})`,
+              data.slice(0, 120),
+            );
+          }
+        }
+      };
 
       if (!reader) {
         yield "エラー: レスポンスストリームを取得できません";
@@ -1009,30 +1062,46 @@ ${pageContent ? `## 📄 現在のWebページ:\n${pageContent.slice(0, 12000)}`
 
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          pending += decoder.decode();
+        } else {
+          pending += decoder.decode(value, { stream: true });
+        }
 
-        const chunk = decoder.decode(value);
-        const lines = chunk
-          .split("\n")
-          .filter((line: string) => line.startsWith("data: "));
+        let lineBreakIndex = pending.indexOf("\n");
+        while (lineBreakIndex !== -1) {
+          const line = pending.slice(0, lineBreakIndex);
+          pending = pending.slice(lineBreakIndex + 1);
 
-        for (const line of lines) {
-          const data = line.slice(6);
-          if (data === "[DONE]") break;
+          for await (const content of processLine(line)) {
+            yield content;
+          }
 
-          try {
-            const parsed = JSON.parse(data);
-            const content = parsed.choices?.[0]?.delta?.content;
-            if (content) {
+          if (streamDone) {
+            return;
+          }
+
+          lineBreakIndex = pending.indexOf("\n");
+        }
+
+        if (done) {
+          if (pending.length > 0) {
+            for await (const content of processLine(pending)) {
               yield content;
             }
-          } catch {
-            // Skip invalid JSON
           }
+          break;
         }
       }
     } catch (error) {
       console.error("LM Studio error:", error);
+      if (error instanceof Error && error.name === "AbortError") {
+        if (abortSignal?.aborted && !timedOut) {
+          return;
+        }
+        yield "エラー: LM Studio の応答がタイムアウトしました。しばらく待ってから再試行してください。";
+        return;
+      }
       yield `エラー: LM Studioに接続できません。\n\n確認事項:\n1. LM Studioが起動しているか\n2. サーバーがStartedになっているか (Local Server → Start)\n3. エンドポイントが正しいか (デフォルト: http://localhost:1234)\n\n詳細: ${error instanceof Error ? error.message : String(error)}`;
     }
   }
