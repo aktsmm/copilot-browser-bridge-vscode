@@ -34,6 +34,9 @@ export interface ModelInfo {
   name: string;
 }
 
+const COPILOT_MODEL_FETCH_RETRY_COUNT = 3;
+const COPILOT_MODEL_FETCH_RETRY_DELAY_MS = 150;
+
 // Tool definitions for agent mode
 interface ToolCall {
   name: string;
@@ -46,6 +49,35 @@ interface ToolResult {
 }
 
 export class LLMRouter {
+  private async selectCopilotModels(
+    selector: { family?: string } = {},
+  ): Promise<vscode.LanguageModelChat[]> {
+    let models: vscode.LanguageModelChat[] = [];
+
+    for (
+      let attempt = 0;
+      attempt < COPILOT_MODEL_FETCH_RETRY_COUNT;
+      attempt++
+    ) {
+      models = await vscode.lm.selectChatModels({
+        vendor: "copilot",
+        ...selector,
+      });
+
+      if (models.length > 0) {
+        return models;
+      }
+
+      if (attempt < COPILOT_MODEL_FETCH_RETRY_COUNT - 1) {
+        await new Promise((resolve) => {
+          setTimeout(resolve, COPILOT_MODEL_FETCH_RETRY_DELAY_MS);
+        });
+      }
+    }
+
+    return models;
+  }
+
   private bindAbortSignal(
     signal: AbortSignal | undefined,
     onAbort: () => void,
@@ -74,10 +106,15 @@ export class LLMRouter {
 
     // Copilot models
     try {
-      const copilotModels = await vscode.lm.selectChatModels({
-        vendor: "copilot",
-      });
+      const copilotModels = await this.selectCopilotModels();
+      const seenFamilies = new Set<string>();
+
       for (const model of copilotModels) {
+        if (seenFamilies.has(model.family)) {
+          continue;
+        }
+
+        seenFamilies.add(model.family);
         models.push({
           provider: "copilot",
           id: model.family,
@@ -350,16 +387,11 @@ ${pageSection}`;
   ): AsyncIterable<string> {
     try {
       // Try to find model by family first
-      let models = await vscode.lm.selectChatModels({
-        vendor: "copilot",
-        family: modelFamily,
-      });
+      let models = await this.selectCopilotModels({ family: modelFamily });
 
       // If not found, try by id
       if (models.length === 0) {
-        models = await vscode.lm.selectChatModels({
-          vendor: "copilot",
-        });
+        models = await this.selectCopilotModels();
         // Filter by id containing the model name
         const filtered = models.filter(
           (m) =>
@@ -375,9 +407,7 @@ ${pageSection}`;
 
       if (!model) {
         yield `エラー: モデル "${modelFamily}" が見つかりません。\n\n利用可能なモデル:\n`;
-        const allModels = await vscode.lm.selectChatModels({
-          vendor: "copilot",
-        });
+        const allModels = await this.selectCopilotModels();
         for (const m of allModels) {
           yield `- ${m.family} (${m.id})\n`;
         }
@@ -438,16 +468,11 @@ ${pageSection}`;
   ): AsyncIterable<string> {
     try {
       // Use the selected model for agent mode
-      let models = await vscode.lm.selectChatModels({
-        vendor: "copilot",
-        family: modelFamily,
-      });
+      let models = await this.selectCopilotModels({ family: modelFamily });
 
       // If not found by family, search by id
       if (models.length === 0) {
-        const allModels = await vscode.lm.selectChatModels({
-          vendor: "copilot",
-        });
+        const allModels = await this.selectCopilotModels();
         const filtered = allModels.filter(
           (m) =>
             m.id.toLowerCase().includes(modelFamily.toLowerCase()) ||
